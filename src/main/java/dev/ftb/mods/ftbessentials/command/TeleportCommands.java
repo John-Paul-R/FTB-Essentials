@@ -8,6 +8,7 @@ import dev.ftb.mods.ftbessentials.util.FTBEPlayerData;
 import dev.ftb.mods.ftbessentials.util.RTPEvent;
 import dev.ftb.mods.ftbessentials.util.TeleportPos;
 import net.minecraft.ChatFormatting;
+import net.minecraft.client.renderer.ChunkBufferBuilderPack;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.DimensionArgument;
@@ -22,14 +23,21 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.TagKey;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkStatus;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraftforge.common.MinecraftForge;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.Iterator;
+import java.util.stream.Stream;
 
 /**
  * @author LatvianModder
@@ -109,9 +117,14 @@ public class TeleportCommands {
 		FTBEPlayerData data = FTBEPlayerData.get(player);
 		return data.rtpTeleporter.teleport(player, p -> {
 			p.displayClientMessage(new TextComponent("Looking for random location..."), false);
-			return findBlockPos(player.getLevel(), p, 1);
+			long start = System.currentTimeMillis();
+			TeleportPos result = findBlockPos(player.getLevel(), p, 1);
+			p.getServer().getGameRules();
+			p.displayClientMessage(new TextComponent("took ages "+Math.round((System.currentTimeMillis()-start)/1000)+"s"), false);
+			return result;
 		}).runCommand(player);
 	}
+
 
 	private static TeleportPos findBlockPos(ServerLevel world, ServerPlayer player, int attempt) {
 		if (attempt > FTBEConfig.RTP_MAX_TRIES.get()) {
@@ -144,14 +157,19 @@ public class TeleportCommands {
 			return findBlockPos(world, player, attempt + 1);
 		}
 
-		world.getChunk(currentPos.getX() >> 4, currentPos.getZ() >> 4, ChunkStatus.HEIGHTMAPS);
-		BlockPos hmPos = world.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, currentPos);
+		int chunkX = currentPos.getX() >> 4;
+		int chunkZ = currentPos.getZ() >> 4;
+		world.getChunk(chunkX, chunkZ, ChunkStatus.HEIGHTMAPS);
+		BlockPos.MutableBlockPos hmPos = new BlockPos.MutableBlockPos().move(world.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, currentPos));
 
 		if (hmPos.getY() > 0) {
-			if (hmPos.getY() >= world.getLogicalHeight()) { // broken heightmap (nether, other mod dimensions)
-				for (BlockPos newPos : BlockPos.spiralAround(new BlockPos(hmPos.getX(), world.getSeaLevel(), hmPos.getY()), 16, Direction.EAST, Direction.SOUTH)) {
-					BlockState bs = world.getBlockState(newPos);
+			if (true) {//hmPos.getY() >= world.getLogicalHeight()) { // broken heightmap (nether, other mod dimensions)
+				var chunk = world.getChunk(chunkX, chunkZ);
+				chunk.getPos().getMaxBlockX();
 
+				for (var newPos : getChunkCandidateBlocks(chunk.getPos())) {
+					newPos.setY(getTop(chunk, newPos.getX(), newPos.getZ()) - 1);
+					BlockState bs = world.getBlockState(newPos);
 					if (bs.getMaterial().isSolidBlocking() && !bs.is(IGNORE_RTP) && world.isEmptyBlock(newPos.above(1)) && world.isEmptyBlock(newPos.above(2)) && world.isEmptyBlock(newPos.above(3))) {
 						player.displayClientMessage(new TextComponent(String.format("Found good location after %d " + (attempt == 1 ? "attempt" : "attempts") + " @ [x %d, z %d]", attempt, newPos.getX(), newPos.getZ())), false);
 						return new TeleportPos(world.dimension(), newPos.above());
@@ -165,6 +183,71 @@ public class TeleportCommands {
 
 		return findBlockPos(world, player, attempt + 1);
 	}
+
+	public static Iterable<BlockPos.MutableBlockPos> getChunkCandidateBlocks(ChunkPos chunkPos) {
+		return () -> new Iterator<>() {
+			private int _idx = -1;
+			private BlockPos.MutableBlockPos _pos = new BlockPos.MutableBlockPos();
+
+			@Override
+			public boolean hasNext() {
+				return _idx < 3;
+			}
+
+			@Override
+			public BlockPos.MutableBlockPos next() {
+				_idx++;
+				return switch (_idx) {
+					case 0 -> _pos.set(chunkPos.getMinBlockX(), 0, chunkPos.getMinBlockZ());
+					case 1 -> _pos.set(chunkPos.getMinBlockX(), 0, chunkPos.getMaxBlockZ());
+					case 2 -> _pos.set(chunkPos.getMaxBlockX(), 0, chunkPos.getMinBlockZ());
+					case 3 -> _pos.set(chunkPos.getMaxBlockX(), 0, chunkPos.getMaxBlockZ());
+					default -> throw new IllegalStateException("Unexpected value: " + _idx);
+				};
+			}
+		};
+	}
+
+// BEGINREF https://github.com/John-Paul-R/Essential-Commands/blob/1.20.x/src/main/java/com/fibermc/essentialcommands/commands/TopCommand.java#L47
+	public static int getTop(ChunkAccess chunk, int x, int z) {
+		final int maxY = calculateMaxY(chunk);
+		final int bottomY = chunk.getMinBuildHeight();
+		if (maxY <= bottomY) {
+			return Integer.MIN_VALUE;
+		}
+
+		final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos(x, maxY, z);
+		boolean isAir1 = chunk.getBlockState(mutablePos).isAir(); // Block at head level
+		boolean isAir2 = chunk.getBlockState(mutablePos.move(Direction.DOWN)).isAir(); // Block at feet level
+		boolean isAir3; // Block below feet
+
+		while (mutablePos.getY() > bottomY) {
+			isAir3 = chunk.getBlockState(mutablePos.move(Direction.DOWN)).isAir();
+			if (!isAir3 && isAir2 && isAir1) { // If there is a floor block and space for player body+head
+				return mutablePos.getY() + 1;
+			}
+
+			isAir1 = isAir2;
+			isAir2 = isAir3;
+		}
+
+		return Integer.MIN_VALUE;
+	}
+
+	private static int calculateMaxY(ChunkAccess chunk) {
+		final int maxY = chunk.getHeight();
+		LevelChunkSection[] sections = chunk.getSections();
+		int maxSectionIndex = Math.min(sections.length - 1, maxY >> 4);
+
+		for (int index = maxSectionIndex; index >= 0; --index) {
+			if (!sections[index].hasOnlyAir()) {
+				return Math.min(index << 4 + 15, maxY);
+			}
+		}
+
+		return Integer.MAX_VALUE;
+	}
+// ENDREF
 
 	public static int tpLast(ServerPlayer player, GameProfile to) {
 		ServerPlayer p = player.server.getPlayerList().getPlayer(to.getId());
